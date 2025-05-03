@@ -5,6 +5,10 @@ API_URL = "http://localhost:8000"
 
 st.title("Agentic AI ProcPlan UI")
 
+# Initialize session state for materials if not exists
+if 'materials' not in st.session_state:
+    st.session_state.materials = [""] * 5
+
 st.header("1. Get Material Composition")
 item = st.text_input("Enter item name:", "Laptop")
 if st.button("Get Composition"):
@@ -12,19 +16,31 @@ if st.button("Get Composition"):
     if resp.ok:
         data = resp.json()
         st.write("### Composition:")
-        for comp in data["components"]:
+        # Update session state with materials from composition
+        materials = []
+        for i, comp in enumerate(data["components"]):
             st.write(f"{comp['material']}: {comp['percentage']}%")
+            materials.append(comp['material'])
+        # Pad with empty strings if less than 5 materials
+        while len(materials) < 5:
+            materials.append("")
+        st.session_state.materials = materials
     else:
         st.error(f"Error: {resp.text}")
 
 st.header("2. Get Market Prices for Materials")
-materials = []
+# Create text inputs with values from session state
 for i in range(5):
-    mat = st.text_input(f"Material {i+1}", "" if i > 0 else "Steel")
-    materials.append(mat)
+    st.session_state.materials[i] = st.text_input(
+        f"Material {i+1}", 
+        st.session_state.materials[i] if st.session_state.materials[i] else ""
+    )
+
 if st.button("Get Market Prices"):
-    if all(materials):
-        resp = requests.post(f"{API_URL}/v1/marketprice", json={"materials": materials})
+    # Filter out empty materials
+    valid_materials = [mat for mat in st.session_state.materials if mat]
+    if len(valid_materials) > 0:
+        resp = requests.post(f"{API_URL}/v1/marketprice", json={"materials": valid_materials})
         if resp.ok:
             data = resp.json()
             st.write("### Market Prices:")
@@ -33,4 +49,4 @@ if st.button("Get Market Prices"):
         else:
             st.error(f"Error: {resp.text}")
     else:
-        st.warning("Please enter all 5 materials.")
+        st.warning("Please enter at least one material.")

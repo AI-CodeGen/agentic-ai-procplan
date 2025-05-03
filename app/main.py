@@ -21,8 +21,8 @@ def composition_endpoint(req: CompositionRequest):
 
 @app.post("/v1/marketprice", response_model=MarketPriceResponse)
 def marketprice_endpoint(req: MarketPriceRequest):
-    if len(req.materials) != 5:
-        raise HTTPException(status_code=400, detail="Exactly 5 materials must be provided.")
+    if not req.materials:
+        raise HTTPException(status_code=400, detail="At least one material must be provided.")
     prices = get_market_prices(req.materials)
     return MarketPriceResponse(prices=prices)
 
