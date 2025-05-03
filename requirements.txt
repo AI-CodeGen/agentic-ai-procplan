@@ -1,0 +1,8 @@
+langchain
+langserve
+fastapi
+uvicorn
+pydantic
+openapi-schema-pydantic
+streamlit
+requests 

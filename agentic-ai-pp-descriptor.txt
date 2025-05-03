@@ -1,0 +1,6 @@
+Create a langchain based application with with agentic ai approach, with following requirement -
+1) Using opensource LLM, say Ollama, add an ai agent(namely composition agent) which can take an item in string format and can break it down into its top 5 component materials with a approximate percentage. Serve endpoint for the same using langserve, name the endpoint as /v1/composition, so that external user can request an item and get the broken down material composition as response. 
+2) Using opensource LLM, say Ollama, add an another ai agent(namely market agent) which can take the material composition for an item from the previously created composition agent and map it to NASDAQ scrips and fetch the market price for those top 5 materials. Also, Serve endpoint for the same using langserve, name the endpoint as /v1/marketprice, so that external user can provide an json object in request body containing 5 materials and get the market price for all 5 materials as json response. 
+
+Create a swagger and swagger endpoint for the exposed application endpoints.
+Also create a streamlit UI for local testing and validation.
