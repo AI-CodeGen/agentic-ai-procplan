@@ -1,7 +1,9 @@
 from typing import Dict, List, Optional, Tuple
 import time
 import logging
-from langchain_community.utilities.alpha_vantage import AlphaVantageAPIWrapper
+import pandas as pd
+from alpha_vantage.timeseries import TimeSeries
+from alpha_vantage.foreignexchange import ForeignExchange
 from app.config import settings, llm
 from app.agents.material_to_symbol_mapping import MATERIAL_TO_SYMBOL
 from app.agents.av_commodity_map import ALPHA_VANTAGE_COMMODITIES
@@ -141,9 +143,10 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
         current_time = time.time()
         prices = {}
         
-        # Initialize Alpha Vantage wrapper
-        logger.info(f"Initializing Alpha Vantage wrapper with API key: {settings.ALPHA_VANTAGE_API_KEY[:4]}...")
-        alpha_vantage = AlphaVantageAPIWrapper(alphavantage_api_key=settings.ALPHA_VANTAGE_API_KEY)
+        # Initialize Alpha Vantage clients
+        logger.info(f"Initializing Alpha Vantage clients with API key: {settings.ALPHA_VANTAGE_API_KEY[:4]}...")
+        ts = TimeSeries(key=settings.ALPHA_VANTAGE_API_KEY, output_format='pandas')
+        fx = ForeignExchange(key=settings.ALPHA_VANTAGE_API_KEY)
         
         for material in materials:
             logger.info(f"\nProcessing material: {material}")
@@ -162,8 +165,10 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
             # If no direct Alpha Vantage mapping, try to find a manufacturer
             if not symbol:
                 logger.info(f"No direct Alpha Vantage mapping for {material}, looking for manufacturer")
-                symbol, company_name = find_material_manufacturer(material, llm)
-                if symbol:
+                manufacturers = find_material_manufacturer(material, llm)
+                if manufacturers and len(manufacturers) > 0:
+                    # Use the first manufacturer from the list
+                    symbol, company_name = manufacturers[0]
                     logger.info(f"Found manufacturer {company_name} ({symbol}) for {material}")
             
             # If still no mapping found, try the existing symbol mapping
@@ -192,22 +197,22 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
                     time.sleep(sleep_time)
                 
                 # Get the latest price data
-                logger.info(f"Fetching price for {material} using symbol {symbol}")
+                logger.info(f"Next Step, Fetching price for {material} using symbol - {symbol}")
                 
                 # Try different endpoints based on the symbol type
                 if symbol.startswith('X'):  # Forex symbols (e.g., XAUUSD)
                     logger.info(f"Getting exchange rate for {symbol}")
-                    data = alpha_vantage.get_currency_exchange_rate(from_currency=symbol[:3], to_currency='USD')
+                    data, _ = fx.get_currency_exchange_rate(from_currency=symbol[:3], to_currency='USD')
                     latest_price = float(data['5. Exchange Rate'])
                 else:  # Stock or commodity symbols
-                    logger.info(f"Getting intraday price for {symbol}")
-                    data = alpha_vantage.get_intraday(symbol=symbol, interval='1min', outputsize='compact')
-                    if data and 'Time Series (1min)' in data:
-                        latest_time = max(data['Time Series (1min)'].keys())
-                        latest_price = float(data['Time Series (1min)'][latest_time]['4. close'])
-                        logger.info(f"Intraday price for {symbol}: ${latest_price}")
+                    logger.info(f"Getting quote for {symbol}")
+                    data, _ = ts.get_quote_endpoint(symbol=symbol)
+                    # The API returns a pandas DataFrame with the price in the '05. price' column
+                    if isinstance(data, pd.DataFrame) and not data.empty:
+                        latest_price = float(data['05. price'].iloc[0])
+                        logger.info(f"Quote price for {symbol}: ${latest_price}")
                     else:
-                        raise ValueError("No price data available")
+                        raise ValueError(f"No price data available for {symbol}")
                 
                 last_api_call = time.time()
                 logger.info(f"API Response for {material}: ${latest_price}")
@@ -221,7 +226,42 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
                 
             except Exception as e:
                 logger.error(f"Error fetching price for {material}: {str(e)}")
-                prices[material] = 100.0  # Default price on error
+                try:
+                    # Try to find a manufacturer for the material
+                    logger.info(f"Attempting to find manufacturer for {material}")
+                    manufacturers = find_material_manufacturer(material, llm)
+                    
+                    if manufacturers and len(manufacturers) > 0:
+                        # Use the first manufacturer from the list
+                        symbol, company_name = manufacturers[0]
+                        logger.info(f"Found manufacturer {company_name} ({symbol}) for {material}")
+                        
+                        # Rate limiting for the new API call
+                        time_since_last_call = time.time() - last_api_call
+                        if time_since_last_call < RATE_LIMIT_DELAY:
+                            sleep_time = RATE_LIMIT_DELAY - time_since_last_call
+                            logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                            time.sleep(sleep_time)
+                        
+                        # Try to get the manufacturer's stock price
+                        data, _ = ts.get_quote_endpoint(symbol=symbol)
+                        if isinstance(data, pd.DataFrame) and not data.empty:
+                            latest_price = float(data['05. price'].iloc[0])
+                            logger.info(f"Using manufacturer {company_name}'s stock price for {material}: ${latest_price}")
+                            
+                            prices[material] = latest_price
+                            price_cache[material] = latest_price
+                            last_update_time[material] = current_time
+                            last_api_call = time.time()
+                            continue
+                    
+                    # If manufacturer lookup fails or no price available, use default price
+                    logger.warning(f"Using default price for {material} after manufacturer lookup failed")
+                    prices[material] = 100.0
+                    
+                except Exception as manufacturer_error:
+                    logger.error(f"Error in manufacturer fallback for {material}: {str(manufacturer_error)}")
+                    prices[material] = 100.0  # Default price on error
         
         return prices
         
