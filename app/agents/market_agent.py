@@ -1,106 +1,119 @@
 from typing import Dict, List
-from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers import PydanticOutputParser
-from app.config import settings
-from pydantic import BaseModel
-import json
+import time
+import logging
+from alpha_vantage.timeseries import TimeSeries
+from app.config import settings, llm
+from app.agents.symbolMapping import MATERIAL_TO_SYMBOL
+from langchain_core.prompts import ChatPromptTemplate
 
-# Define the response schema
-class MarketPriceMapping(BaseModel):
-    prices: Dict[str, float]
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Initialize Ollama
-llm = Ollama(
-    base_url=settings.OLLAMA_BASE_URL,
-    model=settings.OLLAMA_MODEL
-)
+# Cache for storing prices
+price_cache = {}
+last_update_time = {}
 
-# Create output parser
-parser = PydanticOutputParser(pydantic_object=MarketPriceMapping)
+# Cache for storing similarity mappings
+similarity_cache = {}
 
-# Create prompt template
-template = """
-You are an expert in material markets and commodity trading.
-Your task is to map the given materials to their approximate current market prices in USD.
+def find_similar_material(material: str) -> str:
+    """Find a similar material from the mapping using LLM."""
+    try:
+        # Check cache first
+        if material in similarity_cache:
+            logger.info(f"Using cached similarity mapping for {material}: {similarity_cache[material]}")
+            return similarity_cache[material]
 
-Materials: {materials}
+        # Create prompt for similarity matching
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert in material science and commodity markets.
+            Given a material name, find the most similar material from the provided list.
+            Return ONLY the exact material name from the list, nothing else.
+            
+            Available materials: {materials}"""),
+            ("human", "Find the most similar material to: {material}")
+        ])
 
-For each material, provide a realistic current market price in USD.
-Consider the following factors:
-- Current market conditions
-- Material purity/grade
-- Standard unit prices
-- Recent market trends
-
-Format your response as a JSON object with the following structure:
-{{
-    "prices": {{
-        "material1": price1,
-        "material2": price2,
-        ...
-    }}
-}}
-
-Example response:
-{{
-    "prices": {{
-        "Steel": 800.0,
-        "Aluminum": 2500.0,
-        "Copper": 9500.0,
-        "Plastic": 1200.0,
-        "Glass": 300.0
-    }}
-}}
-
-{format_instructions}
-"""
-
-prompt = PromptTemplate(
-    template=template,
-    input_variables=["materials"],
-    partial_variables={"format_instructions": parser.get_format_instructions()}
-)
+        # Get list of available materials
+        available_materials = list(MATERIAL_TO_SYMBOL.keys())
+        
+        # Create chain
+        chain = prompt | llm
+        
+        # Get response
+        response = chain.invoke({
+            "material": material,
+            "materials": ", ".join(available_materials)
+        })
+        
+        # Clean and validate response
+        similar_material = response.strip()
+        if similar_material in MATERIAL_TO_SYMBOL:
+            # Cache the result
+            similarity_cache[material] = similar_material
+            logger.info(f"Found similar material for {material}: {similar_material}")
+            return similar_material
+        else:
+            logger.warning(f"LLM returned invalid material name: {similar_material}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error finding similar material for {material}: {str(e)}")
+        return None
 
 def get_market_prices(materials: List[str]) -> Dict[str, float]:
     try:
-        # Create the chain
-        chain = prompt | llm
+        current_time = time.time()
+        prices = {}
         
-        # Get the response
-        response = chain.invoke({"materials": materials})
+        # Initialize Alpha Vantage client
+        ts = TimeSeries(key=settings.ALPHA_VANTAGE_API_KEY, output_format='pandas')
         
-        # Try to parse the response as JSON
-        try:
-            # Extract JSON from the response if it's wrapped in markdown code blocks
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0].strip()
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0].strip()
+        for material in materials:
+            # Check if we have a cached price that's still valid
+            if (material in price_cache and 
+                material in last_update_time and 
+                current_time - last_update_time[material] < settings.CACHE_EXPIRY):
+                prices[material] = price_cache[material]
+                continue
             
-            # Parse the JSON response
-            parsed_response = json.loads(response)
-            return parsed_response["prices"]
-        except json.JSONDecodeError:
-            # If JSON parsing fails, try to extract prices from the text
-            prices = {}
-            for line in response.split("\n"):
-                if ":" in line and "$" in line:
-                    try:
-                        material, price = line.split(":")
-                        material = material.strip()
-                        price = float(price.strip().replace("$", "").replace(",", ""))
-                        prices[material] = price
-                    except:
-                        continue
+            # Get the commodity symbol for the material
+            symbol = MATERIAL_TO_SYMBOL.get(material)
             
-            if prices:
-                return prices
+            # If no direct mapping found, try similarity matching
+            if not symbol:
+                logger.info(f"No direct mapping found for {material}, attempting similarity matching")
+                similar_material = find_similar_material(material)
+                if similar_material:
+                    symbol = MATERIAL_TO_SYMBOL[similar_material]
+                    logger.info(f"Using symbol {symbol} from similar material {similar_material}")
+                else:
+                    logger.warning(f"No similar material found for {material}, using default price")
+                    prices[material] = 100.0
+                    continue
             
-            # If all parsing attempts fail, return default prices
-            return {mat: 100.0 for mat in materials}
-            
+            try:
+                # Get the latest price data
+                data, meta_data = ts.get_intraday(symbol=symbol, interval='1min', outputsize='compact')
+                if not data.empty:
+                    latest_price = float(data['4. close'].iloc[0])
+                    prices[material] = latest_price
+                    
+                    # Update cache
+                    price_cache[material] = latest_price
+                    last_update_time[material] = current_time
+                    logger.info(f"Updated price for {material}: ${latest_price}")
+                else:
+                    logger.warning(f"No price data available for {material}, using default price")
+                    prices[material] = 100.0  # Default price if no data available
+            except Exception as e:
+                logger.error(f"Error fetching price for {material}: {str(e)}")
+                prices[material] = 100.0  # Default price on error
+        
+        return prices
+        
     except Exception as e:
-        print(f"Error in get_market_prices: {str(e)}")
+        logger.error(f"Error in get_market_prices: {str(e)}")
         # Return default prices in case of any error
         return {mat: 100.0 for mat in materials}
