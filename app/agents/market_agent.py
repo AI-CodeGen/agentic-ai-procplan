@@ -1,13 +1,18 @@
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import time
 import logging
-from alpha_vantage.timeseries import TimeSeries
+from langchain_community.utilities.alpha_vantage import AlphaVantageAPIWrapper
 from app.config import settings, llm
-from app.agents.symbolMapping import MATERIAL_TO_SYMBOL
+from app.agents.material_to_symbol_mapping import MATERIAL_TO_SYMBOL
+from app.agents.av_commodity_map import ALPHA_VANTAGE_COMMODITIES
+from app.agents.company_mapping import find_material_manufacturer
 from langchain_core.prompts import ChatPromptTemplate
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Cache for storing prices
@@ -16,6 +21,71 @@ last_update_time = {}
 
 # Cache for storing similarity mappings
 similarity_cache = {}
+
+# Cache for storing commodity mappings
+commodity_mapping_cache = {}
+
+# Cache for storing manufacturer mappings
+manufacturer_mapping_cache = {}
+
+# Rate limiting
+RATE_LIMIT_DELAY = 12  # Alpha Vantage free tier allows 5 calls per minute
+last_api_call = 0
+
+def map_to_alpha_vantage_commodity(material: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Maps a material to the closest Alpha Vantage supported commodity using LLM.
+    Returns a tuple of (symbol, commodity_name) or (None, None) if no match found.
+    """
+    try:
+        # Check cache first
+        if material in commodity_mapping_cache:
+            logger.info(f"Using cached commodity mapping for {material}: {commodity_mapping_cache[material]}")
+            return commodity_mapping_cache[material]
+
+        # Create prompt for commodity mapping
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert in commodity markets and material science.
+            Your task is to map a given material to the closest available commodity in the Alpha Vantage API.
+            Return ONLY the exact commodity name from the provided list, nothing else.
+            
+            Available commodities and their symbols:
+            {commodities}
+            
+            If no suitable match is found, return 'NONE'."""),
+            ("human", "Map this material to the closest commodity: {material}")
+        ])
+
+        # Format commodities list for the prompt
+        commodities_list = "\n".join([f"{symbol}: {name}" for symbol, name in ALPHA_VANTAGE_COMMODITIES.items()])
+        
+        # Create chain
+        chain = prompt | llm
+        
+        # Get response
+        response = chain.invoke({
+            "material": material,
+            "commodities": commodities_list
+        })
+        
+        # Clean and validate response
+        mapped_commodity = response.strip()
+        logger.info(f"LLM response for {material}: {mapped_commodity}")
+        
+        # Find the symbol for the mapped commodity
+        for symbol, name in ALPHA_VANTAGE_COMMODITIES.items():
+            if name.lower() == mapped_commodity.lower():
+                # Cache the result
+                commodity_mapping_cache[material] = (symbol, name)
+                logger.info(f"Mapped {material} to {name} ({symbol})")
+                return symbol, name
+        
+        logger.warning(f"No suitable Alpha Vantage commodity found for {material}")
+        return None, None
+            
+    except Exception as e:
+        logger.error(f"Error mapping material to commodity for {material}: {str(e)}")
+        return None, None
 
 def find_similar_material(material: str) -> str:
     """Find a similar material from the mapping using LLM."""
@@ -37,6 +107,7 @@ def find_similar_material(material: str) -> str:
 
         # Get list of available materials
         available_materials = list(MATERIAL_TO_SYMBOL.keys())
+        logger.info(f"Available materials for matching: {available_materials}")
         
         # Create chain
         chain = prompt | llm
@@ -49,6 +120,8 @@ def find_similar_material(material: str) -> str:
         
         # Clean and validate response
         similar_material = response.strip()
+        logger.info(f"LLM response for {material}: {similar_material}")
+        
         if similar_material in MATERIAL_TO_SYMBOL:
             # Cache the result
             similarity_cache[material] = similar_material
@@ -63,50 +136,89 @@ def find_similar_material(material: str) -> str:
         return None
 
 def get_market_prices(materials: List[str]) -> Dict[str, float]:
+    global last_api_call
     try:
         current_time = time.time()
         prices = {}
         
-        # Initialize Alpha Vantage client
-        ts = TimeSeries(key=settings.ALPHA_VANTAGE_API_KEY, output_format='pandas')
+        # Initialize Alpha Vantage wrapper
+        logger.info(f"Initializing Alpha Vantage wrapper with API key: {settings.ALPHA_VANTAGE_API_KEY[:4]}...")
+        alpha_vantage = AlphaVantageAPIWrapper(alphavantage_api_key=settings.ALPHA_VANTAGE_API_KEY)
         
         for material in materials:
+            logger.info(f"\nProcessing material: {material}")
+            
             # Check if we have a cached price that's still valid
             if (material in price_cache and 
                 material in last_update_time and 
                 current_time - last_update_time[material] < settings.CACHE_EXPIRY):
                 prices[material] = price_cache[material]
+                logger.info(f"Using cached price for {material}: ${price_cache[material]}")
                 continue
             
-            # Get the commodity symbol for the material
-            symbol = MATERIAL_TO_SYMBOL.get(material)
+            # First try to map to Alpha Vantage commodity
+            symbol, commodity_name = map_to_alpha_vantage_commodity(material)
             
-            # If no direct mapping found, try similarity matching
+            # If no direct Alpha Vantage mapping, try to find a manufacturer
             if not symbol:
-                logger.info(f"No direct mapping found for {material}, attempting similarity matching")
-                similar_material = find_similar_material(material)
-                if similar_material:
-                    symbol = MATERIAL_TO_SYMBOL[similar_material]
-                    logger.info(f"Using symbol {symbol} from similar material {similar_material}")
-                else:
-                    logger.warning(f"No similar material found for {material}, using default price")
-                    prices[material] = 100.0
-                    continue
+                logger.info(f"No direct Alpha Vantage mapping for {material}, looking for manufacturer")
+                symbol, company_name = find_material_manufacturer(material, llm)
+                if symbol:
+                    logger.info(f"Found manufacturer {company_name} ({symbol}) for {material}")
+            
+            # If still no mapping found, try the existing symbol mapping
+            if not symbol:
+                symbol = MATERIAL_TO_SYMBOL.get(material)
+                logger.info(f"Direct symbol mapping for {material}: {symbol}")
+                
+                # If still no mapping found, try similarity matching
+                if not symbol:
+                    logger.info(f"No direct mapping found for {material}, attempting similarity matching")
+                    similar_material = find_similar_material(material)
+                    if similar_material:
+                        symbol = MATERIAL_TO_SYMBOL[similar_material]
+                        logger.info(f"Using symbol {symbol} from similar material {similar_material}")
+                    else:
+                        logger.warning(f"No similar material found for {material}, using default price")
+                        prices[material] = 100.0
+                        continue
             
             try:
+                # Rate limiting
+                time_since_last_call = current_time - last_api_call
+                if time_since_last_call < RATE_LIMIT_DELAY:
+                    sleep_time = RATE_LIMIT_DELAY - time_since_last_call
+                    logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                    time.sleep(sleep_time)
+                
                 # Get the latest price data
-                data, meta_data = ts.get_intraday(symbol=symbol, interval='1min', outputsize='compact')
-                if not data.empty:
-                    latest_price = float(data['4. close'].iloc[0])
-                    prices[material] = latest_price
-                    
-                    # Update cache
-                    price_cache[material] = latest_price
-                    last_update_time[material] = current_time
-                    logger.info(f"Updated price for {material}: ${latest_price}")
-                else:
-                    logger.warning(f"No price data available for {material}, using default price")
-                    prices[material] = 100.0  # Default price if no data available
+                logger.info(f"Fetching price for {material} using symbol {symbol}")
+                
+                # Try different endpoints based on the symbol type
+                if symbol.startswith('X'):  # Forex symbols (e.g., XAUUSD)
+                    logger.info(f"Getting exchange rate for {symbol}")
+                    data = alpha_vantage.get_currency_exchange_rate(from_currency=symbol[:3], to_currency='USD')
+                    latest_price = float(data['5. Exchange Rate'])
+                else:  # Stock or commodity symbols
+                    logger.info(f"Getting intraday price for {symbol}")
+                    data = alpha_vantage.get_intraday(symbol=symbol, interval='1min', outputsize='compact')
+                    if data and 'Time Series (1min)' in data:
+                        latest_time = max(data['Time Series (1min)'].keys())
+                        latest_price = float(data['Time Series (1min)'][latest_time]['4. close'])
+                        logger.info(f"Intraday price for {symbol}: ${latest_price}")
+                    else:
+                        raise ValueError("No price data available")
+                
+                last_api_call = time.time()
+                logger.info(f"API Response for {material}: ${latest_price}")
+                
+                prices[material] = latest_price
+                
+                # Update cache
+                price_cache[material] = latest_price
+                last_update_time[material] = current_time
+                logger.info(f"Updated price for {material}: ${latest_price}")
+                
             except Exception as e:
                 logger.error(f"Error fetching price for {material}: {str(e)}")
                 prices[material] = 100.0  # Default price on error
