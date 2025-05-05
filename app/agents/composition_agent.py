@@ -1,5 +1,5 @@
 from typing import List
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser
 from app.schemas import MaterialComponent, CompositionResponse
@@ -7,7 +7,7 @@ from app.config import settings
 import json
 
 # Initialize Ollama
-llm = Ollama(
+llm = OllamaLLM(
     base_url=settings.OLLAMA_BASE_URL,
     model=settings.OLLAMA_MODEL
 )
