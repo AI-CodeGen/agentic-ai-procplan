@@ -25,7 +25,7 @@ def load_company_data() -> Dict[str, str]:
     
     try:
         # Load NASDAQ listed companies
-        with open('app/nasdaqlisted.txt', 'r') as f:
+        with open('app/info/nasdaqlisted.txt', 'r') as f:
             reader = csv.reader(f, delimiter='|')
             next(reader)  # Skip header
             for row in reader:
@@ -34,7 +34,7 @@ def load_company_data() -> Dict[str, str]:
                     companies[name] = symbol
         
         # Load other listed companies
-        with open('app/otherlisted.txt', 'r') as f:
+        with open('app/info/otherlisted.txt', 'r') as f:
             reader = csv.reader(f, delimiter='|')
             next(reader)  # Skip header
             for row in reader:
