@@ -16,6 +16,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global cache for company data
+_COMPANY_DATA_CACHE: Dict[str, str] = {}
+
+def initialize_company_data() -> None:
+    """
+    Initialize the company data cache during server startup.
+    This should be called once when the server starts.
+    """
+    global _COMPANY_DATA_CACHE
+    if not _COMPANY_DATA_CACHE:
+        _COMPANY_DATA_CACHE = load_company_data()
+        logger.info(f"Initialized company data cache with {len(_COMPANY_DATA_CACHE)} companies")
+
 def load_company_data() -> Dict[str, str]:
     """
     Load company data from NASDAQ and other listed files.
@@ -49,6 +62,16 @@ def load_company_data() -> Dict[str, str]:
         logger.error(f"Error loading company data: {str(e)}")
         return {}
 
+def get_company_data() -> Dict[str, str]:
+    """
+    Get company data from cache. If cache is empty, load and cache the data.
+    Returns a dictionary mapping company names to their stock symbols.
+    """
+    global _COMPANY_DATA_CACHE
+    if not _COMPANY_DATA_CACHE:
+        _COMPANY_DATA_CACHE = load_company_data()
+    return _COMPANY_DATA_CACHE
+
 def find_material_manufacturer(material: str, llm, num_manufacturers: int = settings.No_OF_MANUFACTURERS) -> List[Tuple[Optional[str], Optional[str]]]:
     """
     Uses LLM to find the most likely manufacturers of a given material from the listed companies.
@@ -63,31 +86,45 @@ def find_material_manufacturer(material: str, llm, num_manufacturers: int = sett
         List[Tuple[Optional[str], Optional[str]]]: List of (symbol, company_name) tuples
     """
     try:
-        # Load company data
-        companies = load_company_data()
+        # Get company data from cache
+        companies = get_company_data()
         if not companies:
             logger.error("No company data available")
             return []
             
         # Create prompt for manufacturer matching
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are an expert in manufacturing and materials science.
-            Your task is to identify the {num_manufacturers} most likely manufacturers of a given material from the provided list of companies.
-            
-            CRITICAL INSTRUCTIONS:
-            1. Return ONLY company names and their stock symbols from the list below, for one company per line
-            2. DO NOT add any explanations, questions, or additional text
-            3. DO NOT modify the company names in any way
+            ("system", """You are a strict data formatter. Your ONLY task is to return company names and their stock symbols.
+            DO NOT provide any explanations, descriptions, or additional text.
+            DO NOT modify the company names or symbols.
+            DO NOT add any context or reasoning.
+            DO NOT number the results.
+            DO NOT add any dashes or other separators.
+            DO NOT add any colons or other punctuation except the comma between company and symbol.
+            DO NOT add any descriptions about the companies."""),
+            ("system", f"""STRICT FORMAT RULES:
+            1. Return EXACTLY {num_manufacturers} companies from the list below
+            2. Each line MUST be in format: "Company Name, SYMBOL"
+            3. Use ONLY companies from the provided list
             4. If no matches found, return exactly: NONE
+            5. DO NOT add any numbers, dashes, or explanations
+            6. DO NOT add any descriptions or explanations about the companies
+            7. DO NOT add any introductory text
             
-            Example response format:
-            Company Name 1, Stock Symbol 1 
-            Company Name 2, Stock Symbol 2
-            Company Name 3, Stock Symbol 3
+            Example correct response:
+            Dow Inc., DOW
+            DuPont, DD
+            BASF, BASFY
+            
+            Example incorrect responses (DO NOT USE):
+            ❌ Here are the manufacturers:
+            ❌ BASF SE: BASF is a German chemical company
+            ❌ Dow Inc. (DOW) - Chemical company
+            ❌ Dow Inc. - DOW - Chemical manufacturer
             
             Available companies:
             {{companies}}"""),
-            ("human", "Find the most likely manufacturers of this material: {material}")
+            ("human", "Return {num_manufacturers} manufacturers for: {material}")
         ])
         
         # Format companies list for the prompt
@@ -99,12 +136,32 @@ def find_material_manufacturer(material: str, llm, num_manufacturers: int = sett
         # Get response
         response = chain.invoke({
             "material": material,
-            "companies": companies_list
+            "companies": companies_list,
+            "num_manufacturers": num_manufacturers
         })
         
+        logger.info(f"LLM response for COMPANY MAPPING of {material}: {response}")
+        
         # Clean and validate response
-        matched_companies = [company.strip() for company in response.strip().split('\n') if company.strip() and company.strip() != 'NONE']
-        logger.info(f"LLM response for COMPANY MAPPING of {material}: {matched_companies}")
+        matched_companies = []
+        for line in response.strip().split('\n'):
+            line = line.strip()
+            if not line or line == 'NONE':
+                continue
+            # Skip any lines that look like explanations or introductions
+            if any(skip in line.lower() for skip in ['here are', 'following', 'manufacturers of', 'companies that']):
+                continue
+            # Remove any leading numbers, dashes, or other separators
+            line = line.lstrip('0123456789.- ')
+            # Only accept lines that match the exact format
+            if ',' in line and not any(char in line for char in ['(', ')', '-', ':', ';']):
+                matched_companies.append(line)
+            else:
+                logger.warning(f"Skipping invalid format line: {line}")
+        
+        # Ensure we only take the requested number of manufacturers
+        matched_companies = matched_companies[:num_manufacturers]
+        logger.info(f"LLM response for MATCHED COMPANIES of {material}: {matched_companies}")
         
         # Find the symbols for the matched companies
         results = []

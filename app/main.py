@@ -3,8 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.schemas import CompositionRequest, CompositionResponse, MarketPriceRequest, MarketPriceResponse, MaterialComponent
 from app.agents.composition_agent import get_material_composition
 from app.agents.market_agent import get_market_prices
+from app.agents.company_mapping import initialize_company_data
 
 app = FastAPI(title="Agentic AI ProcPlan API", version="1.0.0")
+
+# Initialize company data cache during startup
+@app.on_event("startup")
+async def startup_event():
+    initialize_company_data()
 
 app.add_middleware(
     CORSMiddleware,
