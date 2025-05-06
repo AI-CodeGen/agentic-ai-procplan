@@ -46,23 +46,44 @@ def map_to_alpha_vantage_commodity(material: str) -> Tuple[Optional[str], Option
             return commodity_mapping_cache[material]
 
         # Create prompt for commodity mapping
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert in commodity markets and material science.
-            Your task is to map a given material to the closest available commodity in the Alpha Vantage API.
-            Return ONLY the exact commodity name from the provided list, nothing else.
+        map_to_alpha_vantage_commodity_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a strict symbol matcher. Your ONLY task is to return a single symbol key.
+            DO NOT provide any explanations, descriptions, or additional text.
+            DO NOT return the commodity name.
+            DO NOT add any context or reasoning.
             
-            Available commodities and their symbols:
-            {commodities}
+            STRICT FORMAT RULES:
+            1. Return ONLY the exact symbol key from the list below
+            2. If no match found, return exactly: NONE
+            3. DO NOT add any explanations or descriptions
+            4. DO NOT return the commodity name
+            5. ONLY return a single word response
+            6. Match EXACTLY - if the material name matches a commodity name exactly, use that symbol
+            7. DO NOT make assumptions or creative matches
+            8. If the material name is not an exact match for any commodity name, return NONE
             
-            If no suitable match is found, return 'NONE'."""),
-            ("human", "Map this material to the closest commodity: {material}")
+            Example correct responses:
+            XAUUSD
+            XAGUSD
+            ALUMINUM
+            NONE
+            
+            Example incorrect responses (DO NOT USE):
+            ❌ Gold (XAUUSD)
+            ❌ XAUUSD - Gold
+            ❌ No match found
+            ❌ XPDUSD (for Aluminum)
+            
+            Available symbols and commodities:
+            {commodities}"""),
+            ("human", "Return the symbol key for this material: {material}")
         ])
 
         # Format commodities list for the prompt
         commodities_list = "\n".join([f"{symbol}: {name}" for symbol, name in ALPHA_VANTAGE_COMMODITIES.items()])
         
         # Create chain
-        chain = prompt | llm
+        chain = map_to_alpha_vantage_commodity_prompt | llm
         
         # Get response
         response = chain.invoke({
@@ -71,16 +92,21 @@ def map_to_alpha_vantage_commodity(material: str) -> Tuple[Optional[str], Option
         })
         
         # Clean and validate response
-        mapped_commodity = response.strip()
-        logger.info(f"LLM response for {material}: {mapped_commodity}")
+        mapped_symbol = response.strip().upper()  # Convert to uppercase for consistency
+        logger.info(f"LLM response for {material}: {mapped_symbol}")
         
-        # Find the symbol for the mapped commodity
-        for symbol, name in ALPHA_VANTAGE_COMMODITIES.items():
-            if name.lower() == mapped_commodity.lower():
+        # Check if the response is a valid symbol
+        if mapped_symbol in ALPHA_VANTAGE_COMMODITIES:
+            # Verify that the material name matches the commodity name
+            commodity_name = ALPHA_VANTAGE_COMMODITIES[mapped_symbol]
+            if material.lower() == commodity_name.lower():
                 # Cache the result
-                commodity_mapping_cache[material] = (symbol, name)
-                logger.info(f"Mapped {material} to {name} ({symbol})")
-                return symbol, name
+                commodity_mapping_cache[material] = (mapped_symbol, commodity_name)
+                logger.info(f"Mapped {material} to {commodity_name} ({mapped_symbol})")
+                return mapped_symbol, commodity_name
+            else:
+                logger.warning(f"Symbol {mapped_symbol} found but material {material} doesn't match commodity {commodity_name}")
+                return None, None
         
         logger.warning(f"No suitable Alpha Vantage commodity found for {material}")
         return None, None
@@ -122,7 +148,7 @@ def find_similar_material(material: str) -> str:
         
         # Clean and validate response
         similar_material = response.strip()
-        logger.info(f"LLM response for {material}: {similar_material}")
+        logger.info(f"LLM response for similar to {material}: {similar_material}")
         
         if similar_material in MATERIAL_TO_SYMBOL:
             # Cache the result
@@ -163,6 +189,7 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
             symbol, commodity_name = map_to_alpha_vantage_commodity(material)
             
             # If no direct Alpha Vantage mapping, try to find a manufacturer
+            manufacturers = None
             if not symbol:
                 logger.info(f"No direct Alpha Vantage mapping for {material}, looking for manufacturer")
                 manufacturers = find_material_manufacturer(material, llm)
@@ -226,46 +253,37 @@ def get_market_prices(materials: List[str]) -> Dict[str, float]:
                 
             except Exception as e:
                 logger.error(f"Error fetching price for {material}: {str(e)}")
-                try:
-                    # Try to find a manufacturer for the material
-                    logger.info(f"Attempting to find manufacturer for {material}")
-                    manufacturers = find_material_manufacturer(material, llm)
-                    
-                    if manufacturers and len(manufacturers) > 0:
-                        # Use the first manufacturer from the list
-                        symbol, company_name = manufacturers[0]
-                        logger.info(f"Found manufacturer {company_name} ({symbol}) for {material}")
-                        
-                        # Rate limiting for the new API call
-                        time_since_last_call = time.time() - last_api_call
-                        if time_since_last_call < RATE_LIMIT_DELAY:
-                            sleep_time = RATE_LIMIT_DELAY - time_since_last_call
-                            logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
-                            time.sleep(sleep_time)
-                        
-                        # Try to get the manufacturer's stock price
-                        data, _ = ts.get_quote_endpoint(symbol=symbol)
-                        if isinstance(data, pd.DataFrame) and not data.empty:
-                            latest_price = float(data['05. price'].iloc[0])
-                            logger.info(f"Using manufacturer {company_name}'s stock price for {material}: ${latest_price}")
+                # If we already have manufacturers from earlier, use them
+                if manufacturers and len(manufacturers) > 0:
+                    # Try the next manufacturer in the list
+                    for symbol, company_name in manufacturers[1:]:
+                        try:
+                            # Rate limiting for the new API call
+                            time_since_last_call = time.time() - last_api_call
+                            if time_since_last_call < RATE_LIMIT_DELAY:
+                                sleep_time = RATE_LIMIT_DELAY - time_since_last_call
+                                logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                                time.sleep(sleep_time)
                             
-                            prices[material] = latest_price
-                            price_cache[material] = latest_price
-                            last_update_time[material] = current_time
-                            last_api_call = time.time()
+                            # Try to get the manufacturer's stock price
+                            data, _ = ts.get_quote_endpoint(symbol=symbol)
+                            if isinstance(data, pd.DataFrame) and not data.empty:
+                                latest_price = float(data['05. price'].iloc[0])
+                                logger.info(f"Using manufacturer {company_name}'s stock price for {material}: ${latest_price}")
+                                prices[material] = latest_price
+                                # Update cache
+                                price_cache[material] = latest_price
+                                last_update_time[material] = current_time
+                                break
+                        except Exception as inner_e:
+                            logger.error(f"Error fetching price for manufacturer {company_name}: {str(inner_e)}")
                             continue
-                    
-                    # If manufacturer lookup fails or no price available, use default price
-                    logger.warning(f"Using default price for {material} after manufacturer lookup failed")
+                else:
+                    logger.warning(f"No suitable price found for {material}, using default price")
                     prices[material] = 100.0
-                    
-                except Exception as manufacturer_error:
-                    logger.error(f"Error in manufacturer fallback for {material}: {str(manufacturer_error)}")
-                    prices[material] = 100.0  # Default price on error
         
         return prices
         
     except Exception as e:
         logger.error(f"Error in get_market_prices: {str(e)}")
-        # Return default prices in case of any error
-        return {mat: 100.0 for mat in materials}
+        return {material: 100.0 for material in materials}
